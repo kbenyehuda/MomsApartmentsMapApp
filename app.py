@@ -10,6 +10,7 @@ from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 import os
 import base64
+import tempfile
 
 st.set_page_config(page_title="Mom's Apartments Map", layout="wide")
 st.title("Mom's Apartments Map")
@@ -42,6 +43,17 @@ def geocode_address(address: str, geocode_nominatim, geocode_arcgis):
 st.sidebar.header("Data")
 excel_file = st.sidebar.file_uploader("Upload Excel file", type=["xlsx", "xls"])
 pdf_folder = st.sidebar.text_input("PDF folder path (optional)", placeholder="e.g. data/pdfs")
+# Auto-detect when deployed: use data/pdfs or pdfs if they exist and user left blank
+if not pdf_folder or not pdf_folder.strip():
+    for cand in ["data/pdfs", "pdfs"]:
+        if os.path.isdir(cand):
+            pdf_folder = cand
+            break
+
+# Upload PDFs (select all in folder—Ctrl+A). Loaded only when you open "View Floor Plan".
+pdf_uploads = st.sidebar.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True, help="Select all PDFs from your folder. Loaded only when you click to view.")
+if pdf_uploads:
+    st.sidebar.caption(f"✓ {len(pdf_uploads)} PDFs ready")
 
 # Use dummy data if no upload
 if excel_file is None:
@@ -146,6 +158,17 @@ for addr, (lat, lon) in geocoded.items():
 map_height = 700
 map_data = st_folium(m, height=map_height, use_container_width=True, returned_objects=["last_object_clicked", "last_clicked"])
 
+# Download standalone HTML (send to anyone—they open in browser, no app needed)
+with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
+    tmp.close()
+    try:
+        m.save(tmp.name)
+        with open(tmp.name, "rb") as f:
+            html_bytes = f.read()
+        st.sidebar.download_button("📥 Download HTML map", html_bytes, file_name="apartments_map.html", mime="text/html", help="Standalone file—send to anyone, they open in a browser")
+    finally:
+        os.unlink(tmp.name)
+
 def _dist(c1, c2):
     """Simple distance between (lat,lon) points."""
     return (c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2
@@ -162,32 +185,54 @@ if click_data and "lat" in click_data and "lng" in click_data:
             best_d, best_addr = d, addr
     clicked_addr = best_addr
 
-# ---- Floor plan panel (PDF only—details are in the map popup) ----
+# ---- Floor plan panel (PDF loaded only when she opens "View Floor Plan") ----
+def _get_pdf_bytes(pdf_path: str, pdf_uploads: list) -> bytes | None:
+    """Get PDF bytes from uploads (by filename) or folder. Loaded on demand only."""
+    filename = os.path.basename(pdf_path)
+    cache_key = f"_pdf_{filename}"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+    for f in (pdf_uploads or []):
+        if f.name == filename:
+            data = f.read()
+            st.session_state[cache_key] = data
+            return data
+    if pdf_folder and os.path.isdir(pdf_folder):
+        full = os.path.join(pdf_folder, filename)
+        if os.path.isfile(full):
+            with open(full, "rb") as f:
+                return f.read()
+    return None
+
 if clicked_addr:
     units_at_addr = df[df[address_col] == clicked_addr]
     pdf_col = "Floor Plan PDF" if "Floor Plan PDF" in df.columns else None
-    has_pdfs = pdf_folder and os.path.isdir(pdf_folder) and pdf_col
+    has_source = ((pdf_uploads and len(pdf_uploads) > 0) or (pdf_folder and os.path.isdir(pdf_folder))) and pdf_col
 
-    if has_pdfs:
+    if has_source:
         st.subheader("Floor plans")
         for _, row in units_at_addr.iterrows():
             if pdf_col in row.index and pd.notna(row[pdf_col]):
                 pdf_path = str(row[pdf_col])
                 pdf_filename = os.path.basename(pdf_path)
-                full_path = os.path.join(pdf_folder, pdf_filename)
                 unit_label = row.get("Unit", "")
-                if os.path.isfile(full_path):
-                    with st.expander(f"⊕ {unit_label} — View Floor Plan", expanded=False):
-                        try:
-                            with open(full_path, "rb") as f:
-                                pdf_bytes = f.read()
-                            b64 = base64.b64encode(pdf_bytes).decode()
-                            pdf_html = f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="500" type="application/pdf"></iframe>'
-                            st.markdown(pdf_html, unsafe_allow_html=True)
-                        except Exception as e:
-                            st.caption(f"Could not display PDF: {e}")
-                else:
-                    st.caption(f"PDF not found for {unit_label}: `{full_path}`")
+                load_key = f"_loaded_{clicked_addr}_{unit_label}".replace(" ", "_")
+                with st.expander(f"⊕ {unit_label} — View Floor Plan", expanded=False):
+                    if st.session_state.get(load_key):
+                        with st.spinner("Loading floor plan…"):
+                            pdf_bytes = _get_pdf_bytes(pdf_path, pdf_uploads or [])
+                        if pdf_bytes:
+                            try:
+                                b64 = base64.b64encode(pdf_bytes).decode()
+                                pdf_html = f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="500" type="application/pdf"></iframe>'
+                                st.markdown(pdf_html, unsafe_allow_html=True)
+                            except Exception as e:
+                                st.caption(f"Could not display PDF: {e}")
+                        else:
+                            st.caption(f"PDF not found: `{pdf_filename}`")
+                    elif st.button("Show floor plan", key=load_key):
+                        st.session_state[load_key] = True
+                        st.rerun()
 
 # ---- Apartment list ----
 st.subheader("All Apartments")
