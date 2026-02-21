@@ -10,10 +10,79 @@ from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 from st_aggrid import AgGrid, GridOptionsBuilder, DataReturnMode, GridUpdateMode
 import os
+import re
 import base64
 import tempfile
+import urllib.request
+import urllib.parse
+import json
 
 st.set_page_config(page_title="Mom's Apartments Map", layout="wide")
+
+
+def _extract_drive_folder_id(url_or_id: str) -> str | None:
+    """Extract folder ID from Google Drive URL or return as-is if it looks like an ID."""
+    s = (url_or_id or "").strip()
+    if not s:
+        return None
+    # Full URL: https://drive.google.com/drive/folders/1ABC123...
+    m = re.search(r"/folders/([a-zA-Z0-9_-]{20,})", s)
+    if m:
+        return m.group(1)
+    # https://drive.google.com/open?id=1ABC123
+    m = re.search(r"[?&]id=([a-zA-Z0-9_-]{20,})", s)
+    if m:
+        return m.group(1)
+    # Bare ID (no slashes)
+    if "/" not in s and len(s) >= 20:
+        return s
+    return None
+
+
+def _list_drive_folder(api_key: str, folder_id: str) -> dict[str, str]:
+    """List files in a Google Drive folder. Returns {filename: file_id}."""
+    try:
+        q = urllib.parse.quote(f"'{folder_id}' in parents")
+        url = f"https://www.googleapis.com/drive/v3/files?q={q}&key={api_key}&fields=files(id,name)"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        return {f["name"]: f["id"] for f in data.get("files", [])}
+    except Exception:
+        return {}
+
+
+def _download_drive_file(api_key: str, file_id: str) -> bytes | None:
+    """Download a file from Google Drive by ID."""
+    try:
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&key={api_key}"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read()
+    except Exception:
+        return None
+
+
+def _find_drive_file_for_unit(files: dict[str, str], address: str, unit_index: int) -> tuple[str, str] | None:
+    """
+    Find Drive file by address + unit index. Address must match column D exactly.
+    Files: address.pdf, address.jpeg, address.jpg | address_1.pdf for 2nd unit, etc.
+    Returns (file_id, "pdf"|"image") or None.
+    """
+    base = str(address).strip()  # Identical to column D
+    exts = [".pdf", ".jpeg", ".jpg"]
+    if unit_index == 0:
+        for ext in exts:
+            cand = base + ext
+            if cand in files:
+                return files[cand], "pdf" if ext == ".pdf" else "image"
+    else:
+        suffix = f"_{unit_index}"
+        for ext in exts:
+            cand = base + suffix + ext
+            if cand in files:
+                return files[cand], "pdf" if ext == ".pdf" else "image"
+    return None
 st.title("Mom's Apartments Map")
 
 
@@ -46,18 +115,36 @@ def geocode_address(address: str, geocode_nominatim, geocode_arcgis):
 # ---- Upload ----
 st.sidebar.header("Data")
 excel_file = st.sidebar.file_uploader("Upload Excel file", type=["xlsx", "xls"])
-pdf_folder = st.sidebar.text_input("PDF folder path (optional)", placeholder="e.g. data/pdfs")
-# Auto-detect when deployed: use data/pdfs or pdfs if they exist and user left blank
-if not pdf_folder or not pdf_folder.strip():
-    for cand in ["data/pdfs", "pdfs"]:
-        if os.path.isdir(cand):
-            pdf_folder = cand
-            break
 
-# Upload PDFs (select all in folder—Ctrl+A). Loaded only when you open "View Floor Plan".
-pdf_uploads = st.sidebar.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True, help="Select all PDFs from your folder. Loaded only when you click to view.")
-if pdf_uploads:
-    st.sidebar.caption(f"✓ {len(pdf_uploads)} PDFs ready")
+# PDF source: from secrets (deployed) or local/upload (dev)
+def _get_drive_secrets():
+    try:
+        s = getattr(st, "secrets", None) or {}
+        api_key = (s.get("GOOGLE_DRIVE_API_KEY") or os.environ.get("GOOGLE_DRIVE_API_KEY") or "").strip()
+        folder_val = (s.get("GOOGLE_DRIVE_FOLDER_ID") or os.environ.get("GOOGLE_DRIVE_FOLDER_ID") or "").strip()
+        folder_id = _extract_drive_folder_id(folder_val) if folder_val else None
+        return api_key, folder_id
+    except Exception:
+        return ("", None)
+
+drive_api_key, drive_folder_id = _get_drive_secrets()
+drive_configured = bool(drive_api_key and drive_folder_id)
+
+pdf_folder = None
+pdf_uploads = None
+
+if drive_configured:
+    st.sidebar.caption("✓ PDFs from Google Drive")
+else:
+    pdf_folder = st.sidebar.text_input("PDF folder path (optional)", placeholder="e.g. data/pdfs", key="pdf_folder")
+    if not pdf_folder or not pdf_folder.strip():
+        for cand in ["data/pdfs", "pdfs"]:
+            if os.path.isdir(cand):
+                pdf_folder = cand
+                break
+    pdf_uploads = st.sidebar.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True, help="Select all PDFs. Loaded when you view floor plan.", key="pdf_uploads")
+    if pdf_uploads:
+        st.sidebar.caption(f"✓ {len(pdf_uploads)} PDFs ready")
 
 # Map layer (cached—persists across reruns)
 if "map_layer" not in st.session_state:
@@ -73,16 +160,11 @@ def _get_address_col(df: pd.DataFrame, from_col_d: bool = False) -> str:
         return "כתובת-מיקום"
     return df.columns[0] if from_col_d else (df.columns[3] if len(df.columns) > 3 else df.columns[0])
 
-# Use dummy data if no upload
+# Require Excel upload
 from_col_d = False
 if excel_file is None:
-    dummy_path = "data/apartments.xlsx"
-    if os.path.exists(dummy_path):
-        df = pd.read_excel(dummy_path)
-        st.sidebar.info(f"Using dummy data: {len(df)} apartments")
-    else:
-        st.warning("No Excel file uploaded. Run `python create_dummy_data.py` to generate dummy data, or upload an Excel file.")
-        st.stop()
+    st.info("Please upload an Excel file.")
+    st.stop()
 else:
     df_full = pd.read_excel(excel_file, sheet_name="דירוג", header=0)
     df = df_full.iloc[:, 3:]  # columns D onwards (skip A,B,C)
@@ -167,7 +249,7 @@ m = folium.Map(location=center, zoom_start=13, tiles=_default_tiles)
 # Opaque popup + scrollable content; RTL for Hebrew
 popup_css = """
 .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: white !important; opacity: 1 !important; }
-.leaflet-popup-content { margin: 12px 16px !important; max-height: 280px !important; overflow-y: auto !important; direction: rtl !important; text-align: right !important; }
+.leaflet-popup-content { margin: 12px 16px !important; max-height: 450px !important; overflow-y: auto !important; direction: rtl !important; text-align: right !important; }
 """
 m.get_root().header.add_child(folium.Element(f"<style>{popup_css}</style>"))
 
@@ -222,6 +304,14 @@ home_icon = folium.DivIcon(
     icon_anchor=(14, 14),
 )
 
+# Pre-load Drive file list when configured
+drive_files: dict[str, str] = {}
+if drive_configured and drive_api_key and drive_folder_id:
+    list_key = f"_drive_list_{drive_folder_id}"
+    if list_key not in st.session_state:
+        st.session_state[list_key] = _list_drive_folder(drive_api_key, drive_folder_id)
+    drive_files = st.session_state[list_key]
+
 # Only show markers for addresses that have filtered apartments
 for addr, (lat, lon) in geocoded.items():
     units = filtered_df[filtered_df[address_col] == addr]
@@ -247,6 +337,20 @@ for addr, (lat, lon) in geocoded.items():
                 unit_lines.append(f"<tr><td style='padding:2px 8px 2px 0;vertical-align:top'><b>{display_name}:</b></td><td>{val_html}</td></tr>")
         unit_html = f"<table style='margin-bottom:4px'>{''.join(unit_lines)}</table>"
         popup_parts.append(unit_html)
+
+        # Floor plan: small preview + view in new tab (when Drive configured)
+        if drive_files:
+            found = _find_drive_file_for_unit(drive_files, addr, i)
+            if found:
+                fid, _ = found
+                preview_url = f"https://drive.google.com/file/d/{fid}/preview"
+                view_url = f"https://drive.google.com/file/d/{fid}/view"
+                popup_parts.append(
+                    f'<div style="margin:8px 0 12px 0; text-align:center">'
+                    f'<iframe src="{preview_url}" width="180" height="140" style="border:1px solid #ccc; border-radius:4px" allow="autoplay"></iframe><br>'
+                    f'<a href="{view_url}" target="_blank" rel="noopener" style="font-size:12px; margin-top:4px; display:inline-block">View in new tab</a>'
+                    f'</div>'
+                )
 
     n_units = len(units)
     score_col = None
@@ -309,50 +413,101 @@ if click_data and "lat" in click_data and "lng" in click_data:
     clicked_addr = best_addr
 
 # ---- Floor plan panel (PDF loaded only when she opens "View Floor Plan") ----
-def _get_pdf_bytes(pdf_path: str, pdf_uploads: list) -> bytes | None:
-    """Get PDF bytes from uploads (by filename) or folder. Loaded on demand only."""
+def _get_pdf_bytes(
+    pdf_path: str,
+    pdf_uploads: list | None,
+    pdf_folder: str | None,
+    drive_folder_id: str | None,
+    drive_api_key: str | None,
+) -> bytes | None:
+    """Get PDF bytes from uploads, local folder, or Google Drive. Loaded on demand only."""
     filename = os.path.basename(pdf_path)
     cache_key = f"_pdf_{filename}"
     if cache_key in st.session_state:
         return st.session_state[cache_key]
-    for f in (pdf_uploads or []):
-        if f.name == filename:
-            data = f.read()
-            st.session_state[cache_key] = data
-            return data
+
+    if pdf_uploads:
+        for f in pdf_uploads:
+            if f.name == filename:
+                data = f.read()
+                st.session_state[cache_key] = data
+                return data
+
     if pdf_folder and os.path.isdir(pdf_folder):
         full = os.path.join(pdf_folder, filename)
         if os.path.isfile(full):
             with open(full, "rb") as f:
-                return f.read()
+                data = f.read()
+                st.session_state[cache_key] = data
+                return data
+
+    if drive_folder_id and drive_api_key:
+        list_key = f"_drive_list_{drive_folder_id}"
+        if list_key not in st.session_state:
+            st.session_state[list_key] = _list_drive_folder(drive_api_key, drive_folder_id)
+        files = st.session_state[list_key]
+        file_id = files.get(filename)
+        if file_id:
+            data = _download_drive_file(drive_api_key, file_id)
+            if data:
+                st.session_state[cache_key] = data
+                return data
+
     return None
 
 if clicked_addr:
     units_at_addr = filtered_df[filtered_df[address_col] == clicked_addr]
-    pdf_col = "Floor Plan PDF" if "Floor Plan PDF" in df.columns else None
-    has_source = ((pdf_uploads and len(pdf_uploads) > 0) or (pdf_folder and os.path.isdir(pdf_folder))) and pdf_col
+    pdf_col = "Floor Plan PDF" if "Floor Plan PDF" in df.columns else next((c for c in df.columns if "PDF" in str(c)), None)
+    has_source = (
+        (pdf_uploads and len(pdf_uploads) > 0)
+        or (pdf_folder and os.path.isdir(pdf_folder))
+        or (drive_folder_id and drive_api_key)
+    )
+    # With Drive, we match by address; with local/upload we need pdf_col
+    if has_source and not drive_configured:
+        has_source = bool(pdf_col)
 
     if has_source:
         st.subheader("Floor plans")
-        for _, row in units_at_addr.iterrows():
-            if pdf_col in row.index and pd.notna(row[pdf_col]):
+        for i, (_, row) in enumerate(units_at_addr.iterrows()):
+            unit_label = row.get("Unit", f"Unit {i+1}")
+            load_key = f"_loaded_{clicked_addr}_{unit_label}_{i}".replace(" ", "_")
+
+            # Resolve file: Drive = by address+index, else = by Excel PDF column
+            pdf_path = None
+            drive_file_id = None
+            if drive_configured and drive_files:
+                found = _find_drive_file_for_unit(drive_files, clicked_addr, i)
+                if found:
+                    drive_file_id = found[0]
+            elif pdf_col and pdf_col in row.index and pd.notna(row[pdf_col]):
                 pdf_path = str(row[pdf_col])
-                pdf_filename = os.path.basename(pdf_path)
-                unit_label = row.get("Unit", "")
-                load_key = f"_loaded_{clicked_addr}_{unit_label}".replace(" ", "_")
+
+            if drive_file_id or pdf_path:
                 with st.expander(f"⊕ {unit_label} — View Floor Plan", expanded=False):
                     if st.session_state.get(load_key):
-                        with st.spinner("Loading floor plan…"):
-                            pdf_bytes = _get_pdf_bytes(pdf_path, pdf_uploads or [])
-                        if pdf_bytes:
-                            try:
-                                b64 = base64.b64encode(pdf_bytes).decode()
-                                pdf_html = f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="500" type="application/pdf"></iframe>'
-                                st.markdown(pdf_html, unsafe_allow_html=True)
-                            except Exception as e:
-                                st.caption(f"Could not display PDF: {e}")
-                        else:
-                            st.caption(f"PDF not found: `{pdf_filename}`")
+                        if drive_file_id:
+                            preview_url = f"https://drive.google.com/file/d/{drive_file_id}/preview"
+                            view_url = f"https://drive.google.com/file/d/{drive_file_id}/view"
+                            st.markdown(f'<iframe src="{preview_url}" width="100%" height="500" style="border:1px solid #ccc"></iframe>', unsafe_allow_html=True)
+                            st.markdown(f'[View in new tab]({view_url})')
+                        elif pdf_path:
+                            with st.spinner("Loading floor plan…"):
+                                pdf_bytes = _get_pdf_bytes(
+                                    pdf_path,
+                                    pdf_uploads or [],
+                                    pdf_folder,
+                                    drive_folder_id,
+                                    drive_api_key,
+                                )
+                            if pdf_bytes:
+                                try:
+                                    b64 = base64.b64encode(pdf_bytes).decode()
+                                    st.markdown(f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="500" type="application/pdf"></iframe>', unsafe_allow_html=True)
+                                except Exception as e:
+                                    st.caption(f"Could not display PDF: {e}")
+                            else:
+                                st.caption(f"PDF not found: `{os.path.basename(pdf_path)}`")
                     elif st.button("Show floor plan", key=load_key):
                         st.session_state[load_key] = True
                         st.rerun()

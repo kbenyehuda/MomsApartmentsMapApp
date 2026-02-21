@@ -16,14 +16,22 @@ Each **row** = one apartment. Example:
 ## Run the app
 
 ```bash
-# 1. Generate dummy data (first time only)
-python create_dummy_data.py
-
-# 2. Install dependencies
 pip install -r requirements.txt
-
-# 3. Launch (use python -m if `streamlit` isn't on PATH)
 python -m streamlit run app.py
 ```
 
-Then open http://localhost:8501. Upload your Excel or use the dummy data. Enter a PDF folder path in the sidebar to view/download floor plans.
+Then open http://localhost:8501. Upload your Excel file. When using Google Drive for PDFs, add the secrets; otherwise use a local PDF folder or upload PDFs.
+
+## Deploy to Streamlit Cloud
+
+1. Push this repo to GitHub. (If `MomsApartmentsMapApp` is inside a larger repo, either deploy from a repo where it is the root, or set main file to `MomsApartmentsMapApp/app.py`.)
+2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
+3. Click **New app** → choose this repo, branch `main`, main file `app.py`.
+4. Before launching: add **Secrets** (Settings → Secrets):
+
+```toml
+GOOGLE_DRIVE_API_KEY = "AIza_your_key"
+GOOGLE_DRIVE_FOLDER_ID = "1ABC_folder_id_from_drive_url"
+```
+
+5. Deploy. Users upload Excel; PDFs load from your Drive automatically. See **GOOGLE_DRIVE_SETUP.md** for details.
