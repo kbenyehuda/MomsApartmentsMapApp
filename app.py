@@ -269,27 +269,37 @@ _tile_map = {
 _default_tiles = _tile_map.get(st.session_state.get("map_layer", "Street"), "OpenStreetMap")
 m = folium.Map(location=center, zoom_start=13, tiles=_default_tiles)
 
-# Opaque popup + scrollable content; RTL for Hebrew; highlight for selected marker (via JS, doesn't change leaflet)
+# Opaque popup + scrollable content; RTL for Hebrew; dark text; highlight for selected marker
 selected_addr = st.session_state.get("_clicked_addr") or ""
 popup_css = """
 .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: white !important; opacity: 1 !important; }
-.leaflet-popup-content { margin: 12px 16px !important; max-height: 450px !important; overflow-y: auto !important; direction: rtl !important; text-align: right !important; }
-[data-addr].selected-marker { filter: drop-shadow(0 0 4px #0066ff) drop-shadow(0 0 8px #0066ff) !important; }
+.leaflet-popup-content { margin: 12px 16px !important; max-height: 450px !important; overflow-y: auto !important; direction: rtl !important; text-align: right !important; color: #333 !important; }
+.leaflet-marker-icon.selected-marker { filter: drop-shadow(0 0 4px #0066ff) drop-shadow(0 0 8px #0066ff) !important; }
 """
 m.get_root().header.add_child(folium.Element(f"<style>{popup_css}</style>"))
-# Script applies highlight to selected marker; runs after map renders (header only, doesn't affect leaflet hash)
+# Script applies highlight to selected marker (add to parent .leaflet-marker-icon); retry until map ready
 highlight_script = f"""
 <script>
 (function() {{
   var sel = {json.dumps(selected_addr)};
   function apply() {{
     document.querySelectorAll('[data-addr]').forEach(function(el) {{
-      el.classList.remove('selected-marker');
-      if (el.dataset.addr === sel) el.classList.add('selected-marker');
+      var icon = el.closest('.leaflet-marker-icon');
+      if (icon) icon.classList.remove('selected-marker');
+      if (el.dataset.addr === sel) {{
+        var icon = el.closest('.leaflet-marker-icon');
+        if (icon) icon.classList.add('selected-marker');
+      }}
     }});
   }}
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function() {{ setTimeout(apply, 150); }});
-  else setTimeout(apply, 150);
+  function run() {{ apply(); }}
+  var attempts = 0;
+  function tryApply() {{
+    apply();
+    if (document.querySelectorAll('[data-addr]').length === 0 && attempts++ < 20) setTimeout(tryApply, 100);
+  }}
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function() {{ setTimeout(tryApply, 300); }});
+  else setTimeout(tryApply, 300);
 }})();
 </script>
 """
@@ -334,7 +344,7 @@ def _price_to_m(val):
 
 def _build_popup_html(addr, units, drive_files, price_col, info_cols_main, info_cols_tzion):
     """Build popup HTML for an address and its units (same as map marker popup)."""
-    popup_parts = [f"<b>{addr}</b>"]
+    popup_parts = ['<div style="color:#333">', f"<b>{addr}</b>"]
     if price_col and price_col in units.columns:
         prices = [_price_to_m(row[price_col]) for _, row in units.iterrows() if pd.notna(row.get(price_col))]
         if prices:
@@ -375,6 +385,7 @@ def _build_popup_html(addr, units, drive_files, price_col, info_cols_main, info_
                     f'<a href="{view_url}" target="_blank" rel="noopener" style="font-size:11px; display:block; margin-top:2px">View in new tab</a>'
                     f'</div></details>'
                 )
+    popup_parts.append("</div>")
     return "".join(popup_parts)
 
 
@@ -482,17 +493,6 @@ else:
             pass
 if clicked_addr is not None:
     st.session_state["_clicked_addr"] = clicked_addr
-
-# ---- Selected address popup (same content as map marker; shown when row clicked or marker clicked) ----
-if clicked_addr:
-    units_at_addr = filtered_df[filtered_df[address_col] == clicked_addr]
-    if not units_at_addr.empty:
-        popup_html = _build_popup_html(clicked_addr, units_at_addr, drive_files or {}, price_col, info_cols_main, info_cols_tzion)
-        st.markdown(
-            f'<div style="background:white;border:1px solid #ccc;border-radius:8px;padding:12px 16px;max-height:450px;overflow-y:auto;direction:rtl;text-align:right;margin-bottom:16px">'
-            f'{popup_html}</div>',
-            unsafe_allow_html=True,
-        )
 
 # ---- Floor plan panel (PDF loaded only when she opens "View Floor Plan") ----
 def _get_pdf_bytes(
