@@ -228,11 +228,20 @@ st.caption("Click a column header to filter, or click a row to view that apartme
 gb = GridOptionsBuilder.from_dataframe(df)
 gb.configure_default_column(filterable=True)
 gb.configure_selection("single", use_checkbox=False)
+tzion_score_col = next((c for c in df.columns if isinstance(c, str) and "ציון" in c and ("סהכ" in c or 'סה"כ' in c)), None)
 for col in df.columns:
+    opts = {}
     if col in numeric_cols:
-        gb.configure_column(col, filter="agNumberColumnFilter", filterParams={"buttons": ["apply", "reset"]})
+        opts["filter"] = "agNumberColumnFilter"
+        opts["filterParams"] = {"buttons": ["apply", "reset"]}
     else:
-        gb.configure_column(col, filter="agSetColumnFilter", filterParams={"excelMode": "windows"})
+        opts["filter"] = "agSetColumnFilter"
+        opts["filterParams"] = {"excelMode": "windows"}
+    if col == address_col:
+        opts["minWidth"] = 280
+    elif col == tzion_score_col:
+        opts["minWidth"] = 120
+    gb.configure_column(col, **opts)
 grid_opts = gb.build()
 
 grid_return = AgGrid(
