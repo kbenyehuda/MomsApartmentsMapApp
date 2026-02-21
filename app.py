@@ -9,6 +9,7 @@ from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 from st_aggrid import AgGrid, GridOptionsBuilder, DataReturnMode, GridUpdateMode
+import html as html_module
 import os
 import re
 import base64
@@ -259,12 +260,31 @@ _tile_map = {
 _default_tiles = _tile_map.get(st.session_state.get("map_layer", "Street"), "OpenStreetMap")
 m = folium.Map(location=center, zoom_start=13, tiles=_default_tiles)
 
-# Opaque popup + scrollable content; RTL for Hebrew
+# Opaque popup + scrollable content; RTL for Hebrew; highlight for selected marker (via JS, doesn't change leaflet)
+selected_addr = st.session_state.get("_clicked_addr") or ""
 popup_css = """
 .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: white !important; opacity: 1 !important; }
 .leaflet-popup-content { margin: 12px 16px !important; max-height: 450px !important; overflow-y: auto !important; direction: rtl !important; text-align: right !important; }
+[data-addr].selected-marker { filter: drop-shadow(0 0 4px #0066ff) drop-shadow(0 0 8px #0066ff) !important; }
 """
 m.get_root().header.add_child(folium.Element(f"<style>{popup_css}</style>"))
+# Script applies highlight to selected marker; runs after map renders (header only, doesn't affect leaflet hash)
+highlight_script = f"""
+<script>
+(function() {{
+  var sel = {json.dumps(selected_addr)};
+  function apply() {{
+    document.querySelectorAll('[data-addr]').forEach(function(el) {{
+      el.classList.remove('selected-marker');
+      if (el.dataset.addr === sel) el.classList.add('selected-marker');
+    }});
+  }}
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function() {{ setTimeout(apply, 150); }});
+  else setTimeout(apply, 150);
+}})();
+</script>
+"""
+m.get_root().header.add_child(folium.Element(highlight_script))
 
 # Additional tile layers
 folium.TileLayer(
@@ -303,6 +323,52 @@ def _price_to_m(val):
         return str(val)
 
 
+def _build_popup_html(addr, units, drive_files, price_col, info_cols_main, info_cols_tzion):
+    """Build popup HTML for an address and its units (same as map marker popup)."""
+    popup_parts = [f"<b>{addr}</b>"]
+    if price_col and price_col in units.columns:
+        prices = [_price_to_m(row[price_col]) for _, row in units.iterrows() if pd.notna(row.get(price_col))]
+        if prices:
+            price_label = price_col.rstrip(':') if isinstance(price_col, str) else "מחיר"
+            popup_parts.append(f"<div style='margin:4px 0 8px 0'><b>{price_label}</b>: {', '.join(prices)}</div>")
+    popup_parts.append("<hr style='margin:8px 0'>")
+    for i, (_, row) in enumerate(units.iterrows()):
+        if i > 0:
+            popup_parts.append("<hr style='margin:14px 0; border: none; border-top: 2px solid #333'>")
+        unit_lines = []
+        for col in info_cols_main:
+            if col in row.index and pd.notna(row[col]):
+                display_name = col.rstrip(':') if isinstance(col, str) else col
+                val = row[col]
+                unit_lines.append(f"<tr><td style='padding:2px 8px 2px 0;vertical-align:top'><b>{display_name}:</b></td><td>{val}</td></tr>")
+        unit_html = f"<table style='margin-bottom:4px'>{''.join(unit_lines)}</table>"
+        popup_parts.append(unit_html)
+        if info_cols_tzion:
+            tzion_lines = []
+            for col in info_cols_tzion:
+                if col in row.index and pd.notna(row[col]):
+                    display_name = col.rstrip(':') if isinstance(col, str) else col
+                    val = row[col]
+                    tzion_lines.append(f"<tr><td style='padding:2px 8px 2px 0;vertical-align:top'><b>{display_name}:</b></td><td><b>{val}</b></td></tr>")
+            if tzion_lines:
+                tzion_table = f"<table style='margin-top:4px'>{''.join(tzion_lines)}</table>"
+                popup_parts.append(f"<details style='margin:4px 0'><summary style='cursor:pointer; font-size:12px'>הצג ציון</summary>{tzion_table}</details>")
+        if drive_files:
+            found = _find_drive_file_for_unit(drive_files, addr, i)
+            if found:
+                fid, _, _ = found
+                preview_url = f"https://drive.google.com/file/d/{fid}/preview"
+                view_url = f"https://drive.google.com/file/d/{fid}/view"
+                popup_parts.append(
+                    '<details style="margin:4px 0"><summary style="cursor:pointer; font-size:12px">הצג תוכנית</summary>'
+                    f'<div style="margin:2px 0; padding:0">'
+                    f'<iframe src="{preview_url}" width="100%" height="120" style="border:1px solid #ccc; border-radius:4px; margin:0" allow="autoplay"></iframe>'
+                    f'<a href="{view_url}" target="_blank" rel="noopener" style="font-size:11px; display:block; margin-top:2px">View in new tab</a>'
+                    f'</div></details>'
+                )
+    return "".join(popup_parts)
+
+
 # Attributes to show in popup (exclude PDF path, address—it's the popup title)
 # ציון columns shown separately in expandable section
 base_cols = [c for c in df.columns if c not in ["Floor Plan PDF", "Address", address_col] and "PDF" not in c]
@@ -311,11 +377,13 @@ base_cols_no_price = [c for c in base_cols if c != price_col] if price_col else 
 info_cols_main = [c for c in base_cols_no_price if "ציון" not in c]
 info_cols_tzion = [c for c in base_cols_no_price if "ציון" in c]
 
-home_icon = folium.DivIcon(
-    html='<div style="font-size: 28px; line-height: 1;">🏠</div>',
-    icon_size=(28, 28),
-    icon_anchor=(14, 14),
-)
+def _make_icon(addr):
+    esc = html_module.escape(str(addr))
+    return folium.DivIcon(
+        html=f'<div style="font-size: 28px; line-height: 1;" data-addr="{esc}">🏠</div>',
+        icon_size=(28, 28),
+        icon_anchor=(14, 14),
+    )
 
 # Pre-load Drive file list when configured
 drive_files: dict[str, str] = {}
@@ -335,52 +403,7 @@ for addr, (lat, lon) in geocoded.items():
     if units.empty:
         continue
 
-    popup_parts = [f"<b>{addr}</b>"]
-    if price_col and price_col in units.columns:
-        prices = [_price_to_m(row[price_col]) for _, row in units.iterrows() if pd.notna(row.get(price_col))]
-        if prices:
-            price_label = price_col.rstrip(':') if isinstance(price_col, str) else "מחיר"
-            popup_parts.append(f"<div style='margin:4px 0 8px 0'><b>{price_label}</b>: {', '.join(prices)}</div>")
-    popup_parts.append("<hr style='margin:8px 0'>")
-    for i, (_, row) in enumerate(units.iterrows()):
-        if i > 0:
-            popup_parts.append("<hr style='margin:14px 0; border: none; border-top: 2px solid #333'>")
-        unit_lines = []
-        for col in info_cols_main:
-            if col in row.index and pd.notna(row[col]):
-                display_name = col.rstrip(':') if isinstance(col, str) else col
-                val = row[col]
-                unit_lines.append(f"<tr><td style='padding:2px 8px 2px 0;vertical-align:top'><b>{display_name}:</b></td><td>{val}</td></tr>")
-        unit_html = f"<table style='margin-bottom:4px'>{''.join(unit_lines)}</table>"
-        popup_parts.append(unit_html)
-
-        # ציון columns: hidden until asked
-        if info_cols_tzion:
-            tzion_lines = []
-            for col in info_cols_tzion:
-                if col in row.index and pd.notna(row[col]):
-                    display_name = col.rstrip(':') if isinstance(col, str) else col
-                    val = row[col]
-                    tzion_lines.append(f"<tr><td style='padding:2px 8px 2px 0;vertical-align:top'><b>{display_name}:</b></td><td><b>{val}</b></td></tr>")
-            if tzion_lines:
-                tzion_table = f"<table style='margin-top:4px'>{''.join(tzion_lines)}</table>"
-                popup_parts.append(f"<details style='margin:4px 0'><summary style='cursor:pointer; font-size:12px'>הצג ציון</summary>{tzion_table}</details>")
-
-        # Floor plan: hidden until asked; minimal padding when shown
-        if drive_files:
-            found = _find_drive_file_for_unit(drive_files, addr, i)
-            if found:
-                fid, _, _ = found
-                preview_url = f"https://drive.google.com/file/d/{fid}/preview"
-                view_url = f"https://drive.google.com/file/d/{fid}/view"
-                popup_parts.append(
-                    '<details style="margin:4px 0"><summary style="cursor:pointer; font-size:12px">הצג תוכנית</summary>'
-                    f'<div style="margin:2px 0; padding:0">'
-                    f'<iframe src="{preview_url}" width="100%" height="120" style="border:1px solid #ccc; border-radius:4px; margin:0" allow="autoplay"></iframe>'
-                    f'<a href="{view_url}" target="_blank" rel="noopener" style="font-size:11px; display:block; margin-top:2px">View in new tab</a>'
-                    f'</div></details>'
-                )
-
+    html = _build_popup_html(addr, units, drive_files or {}, price_col, info_cols_main, info_cols_tzion)
     n_units = len(units)
     score_col = None
     for c in units.columns:
@@ -407,7 +430,7 @@ for addr, (lat, lon) in geocoded.items():
         location=[lat, lon],
         popup=folium.Popup(html, max_width=350),
         tooltip=folium.Tooltip(f"{addr}{units_part}{price_str}{score_str}", sticky=True),
-        icon=home_icon,
+        icon=_make_icon(addr),
     ).add_to(m)
 
 # ---- Render map (full width, large) ----
@@ -451,6 +474,17 @@ else:
             pass
 if clicked_addr is not None:
     st.session_state["_clicked_addr"] = clicked_addr
+
+# ---- Selected address popup (same content as map marker; shown when row clicked or marker clicked) ----
+if clicked_addr:
+    units_at_addr = filtered_df[filtered_df[address_col] == clicked_addr]
+    if not units_at_addr.empty:
+        popup_html = _build_popup_html(clicked_addr, units_at_addr, drive_files or {}, price_col, info_cols_main, info_cols_tzion)
+        st.markdown(
+            f'<div style="background:white;border:1px solid #ccc;border-radius:8px;padding:12px 16px;max-height:450px;overflow-y:auto;direction:rtl;text-align:right;margin-bottom:16px">'
+            f'{popup_html}</div>',
+            unsafe_allow_html=True,
+        )
 
 # ---- Floor plan panel (PDF loaded only when she opens "View Floor Plan") ----
 def _get_pdf_bytes(
