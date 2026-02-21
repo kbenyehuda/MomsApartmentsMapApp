@@ -75,11 +75,11 @@ def _download_drive_file(api_key: str, file_id: str) -> bytes | None:
         return None
 
 
-def _find_drive_file_for_unit(files: dict[str, str], address: str, unit_index: int) -> tuple[str, str] | None:
+def _find_drive_file_for_unit(files: dict[str, str], address: str, unit_index: int) -> tuple[str, str, str] | None:
     """
     Find Drive file by address + unit index. Address must match column D exactly.
     Files: address.pdf, address.jpeg, address.jpg | address_1.pdf for 2nd unit, etc.
-    Returns (file_id, "pdf"|"image") or None.
+    Returns (file_id, "pdf"|"image", filename) or None.
     """
     base = str(address).strip()  # Identical to column D
     exts = [".pdf", ".jpeg", ".jpg"]
@@ -87,13 +87,13 @@ def _find_drive_file_for_unit(files: dict[str, str], address: str, unit_index: i
         for ext in exts:
             cand = base + ext
             if cand in files:
-                return files[cand], "pdf" if ext == ".pdf" else "image"
+                return files[cand], "pdf" if ext == ".pdf" else "image", cand
     else:
         suffix = f"_{unit_index}"
         for ext in exts:
             cand = base + suffix + ext
             if cand in files:
-                return files[cand], "pdf" if ext == ".pdf" else "image"
+                return files[cand], "pdf" if ext == ".pdf" else "image", cand
     return None
 st.title("Mom's Apartments Map")
 
@@ -302,18 +302,24 @@ def _price_to_m(val):
         return str(val)
 
 
-# Attributes to show in popup (exclude PDF path, address—it's the popup title); columns with "ציון" last
-# Price shown under title, so exclude from table
+# Attributes to show in popup (exclude PDF path, address—it's the popup title)
+# ציון columns shown separately in expandable section
 base_cols = [c for c in df.columns if c not in ["Floor Plan PDF", "Address", address_col] and "PDF" not in c]
 price_col = next((c for c in df.columns if isinstance(c, str) and ("מחיר" in c or c == "Price")), None)
 base_cols_no_price = [c for c in base_cols if c != price_col] if price_col else base_cols
-info_cols = [c for c in base_cols_no_price if "ציון" not in c] + [c for c in base_cols_no_price if "ציון" in c]
+info_cols_main = [c for c in base_cols_no_price if "ציון" not in c]
+info_cols_tzion = [c for c in base_cols_no_price if "ציון" in c]
 
-# Home icon for markers (DivIcon with emoji - works without external fonts)
+# Home icons: normal and selected (when this address has PDF shown below)
 home_icon = folium.DivIcon(
     html='<div style="font-size: 28px; line-height: 1;">🏠</div>',
     icon_size=(28, 28),
     icon_anchor=(14, 14),
+)
+home_icon_selected = folium.DivIcon(
+    html='<div style="font-size: 32px; line-height: 1; filter: drop-shadow(0 0 4px #0066ff) drop-shadow(0 0 8px #0066ff);">🏠</div>',
+    icon_size=(32, 32),
+    icon_anchor=(16, 16),
 )
 
 # Pre-load Drive file list when configured
@@ -328,6 +334,8 @@ if drive_configured and drive_api_key and drive_folder_id:
     drive_files = st.session_state[list_key]
     drive_error = st.session_state.get(list_key + "_err")
 
+# Selected address (from previous click) for icon distinction
+selected_addr = st.session_state.get("_clicked_addr")
 # Only show markers for addresses that have filtered apartments
 for addr, (lat, lon) in geocoded.items():
     units = filtered_df[filtered_df[address_col] == addr]
@@ -345,27 +353,39 @@ for addr, (lat, lon) in geocoded.items():
         if i > 0:
             popup_parts.append("<hr style='margin:14px 0; border: none; border-top: 2px solid #333'>")
         unit_lines = []
-        for col in info_cols:
+        for col in info_cols_main:
             if col in row.index and pd.notna(row[col]):
                 display_name = col.rstrip(':') if isinstance(col, str) else col
                 val = row[col]
-                val_html = f"<b>{val}</b>" if isinstance(col, str) and "ציון" in col else str(val)
-                unit_lines.append(f"<tr><td style='padding:2px 8px 2px 0;vertical-align:top'><b>{display_name}:</b></td><td>{val_html}</td></tr>")
+                unit_lines.append(f"<tr><td style='padding:2px 8px 2px 0;vertical-align:top'><b>{display_name}:</b></td><td>{val}</td></tr>")
         unit_html = f"<table style='margin-bottom:4px'>{''.join(unit_lines)}</table>"
         popup_parts.append(unit_html)
 
-        # Floor plan: small preview + view in new tab (when Drive configured)
+        # ציון columns: hidden until asked
+        if info_cols_tzion:
+            tzion_lines = []
+            for col in info_cols_tzion:
+                if col in row.index and pd.notna(row[col]):
+                    display_name = col.rstrip(':') if isinstance(col, str) else col
+                    val = row[col]
+                    tzion_lines.append(f"<tr><td style='padding:2px 8px 2px 0;vertical-align:top'><b>{display_name}:</b></td><td><b>{val}</b></td></tr>")
+            if tzion_lines:
+                tzion_table = f"<table style='margin-top:4px'>{''.join(tzion_lines)}</table>"
+                popup_parts.append(f"<details style='margin:4px 0'><summary style='cursor:pointer; font-size:12px'>הצג ציון</summary>{tzion_table}</details>")
+
+        # Floor plan: hidden until asked; minimal padding when shown
         if drive_files:
             found = _find_drive_file_for_unit(drive_files, addr, i)
             if found:
-                fid, _ = found
+                fid, _, _ = found
                 preview_url = f"https://drive.google.com/file/d/{fid}/preview"
                 view_url = f"https://drive.google.com/file/d/{fid}/view"
                 popup_parts.append(
-                    f'<div style="margin:8px 0 12px 0; text-align:center">'
-                    f'<iframe src="{preview_url}" width="180" height="140" style="border:1px solid #ccc; border-radius:4px" allow="autoplay"></iframe><br>'
-                    f'<a href="{view_url}" target="_blank" rel="noopener" style="font-size:12px; margin-top:4px; display:inline-block">View in new tab</a>'
-                    f'</div>'
+                    '<details style="margin:4px 0"><summary style="cursor:pointer; font-size:12px">הצג תוכנית</summary>'
+                    f'<div style="margin:2px 0; padding:0">'
+                    f'<iframe src="{preview_url}" width="100%" height="120" style="border:1px solid #ccc; border-radius:4px; margin:0" allow="autoplay"></iframe>'
+                    f'<a href="{view_url}" target="_blank" rel="noopener" style="font-size:11px; display:block; margin-top:2px">View in new tab</a>'
+                    f'</div></details>'
                 )
 
     n_units = len(units)
@@ -390,11 +410,12 @@ for addr, (lat, lon) in geocoded.items():
     price_label = (price_col.rstrip(':') if isinstance(price_col, str) else "מחיר") if price_col else "מחיר"
     price_str = f" | <b>{price_label}</b> <b>{', '.join(prices_tooltip)}</b>" if prices_tooltip else ""
     html = "".join(popup_parts)
+    icon = home_icon_selected if addr == selected_addr else home_icon
     folium.Marker(
         location=[lat, lon],
         popup=folium.Popup(html, max_width=350),
         tooltip=folium.Tooltip(f"{addr}{units_part}{price_str}{score_str}", sticky=True),
-        icon=home_icon,
+        icon=icon,
     ).add_to(m)
 
 # ---- Render map (full width, large) ----
@@ -416,7 +437,7 @@ def _dist(c1, c2):
     """Simple distance between (lat,lon) points."""
     return (c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2
 
-# Find which address was clicked (nearest marker)
+# Find which address was clicked (nearest marker); persist for next run (icon distinction)
 clicked_addr = None
 click_data = map_data.get("last_object_clicked") or map_data.get("last_clicked")
 if click_data and "lat" in click_data and "lng" in click_data:
@@ -427,6 +448,8 @@ if click_data and "lat" in click_data and "lng" in click_data:
         if d < best_d:
             best_d, best_addr = d, addr
     clicked_addr = best_addr
+if clicked_addr is not None:
+    st.session_state["_clicked_addr"] = clicked_addr
 
 # ---- Floor plan panel (PDF loaded only when she opens "View Floor Plan") ----
 def _get_pdf_bytes(
@@ -494,22 +517,27 @@ if clicked_addr:
             # Resolve file: Drive = by address+index, else = by Excel PDF column
             pdf_path = None
             drive_file_id = None
+            display_filename = None
             if drive_configured and drive_files:
                 found = _find_drive_file_for_unit(drive_files, clicked_addr, i)
                 if found:
-                    drive_file_id = found[0]
+                    drive_file_id, _, display_filename = found
                     any_found = True
             elif pdf_col and pdf_col in row.index and pd.notna(row[pdf_col]):
                 pdf_path = str(row[pdf_col])
+                display_filename = os.path.basename(pdf_path)
                 any_found = True
 
             if drive_file_id or pdf_path:
-                with st.expander(f"⊕ {unit_label} — View Floor Plan", expanded=False):
+                expander_label = f"{clicked_addr} {i+1}"
+                with st.expander(f"⊕ {expander_label}", expanded=False):
                     if st.session_state.get(load_key):
+                        if display_filename:
+                            st.caption(f"**{display_filename}**")
                         if drive_file_id:
                             preview_url = f"https://drive.google.com/file/d/{drive_file_id}/preview"
                             view_url = f"https://drive.google.com/file/d/{drive_file_id}/view"
-                            st.markdown(f'<iframe src="{preview_url}" width="100%" height="500" style="border:1px solid #ccc"></iframe>', unsafe_allow_html=True)
+                            st.markdown(f'<iframe src="{preview_url}" width="100%" height="480" style="border:1px solid #ccc; margin:0"></iframe>', unsafe_allow_html=True)
                             st.markdown(f'[View in new tab]({view_url})')
                         elif pdf_path:
                             with st.spinner("Loading floor plan…"):
