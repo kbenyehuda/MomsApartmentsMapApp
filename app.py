@@ -247,7 +247,15 @@ if filtered_df is None or filtered_df.empty:
     filtered_df = df
 
 # ---- Build map (using filtered_df from table) ----
-center = list(geocoded.values())[0]
+# Preserve map view across reruns (avoid jump when clicking marker)
+default_center = list(geocoded.values())[0]
+default_zoom = 13
+if "map_center" not in st.session_state:
+    st.session_state["map_center"] = default_center
+if "map_zoom" not in st.session_state:
+    st.session_state["map_zoom"] = default_zoom
+center = st.session_state["map_center"]
+zoom = st.session_state["map_zoom"]
 _tile_map = {
     "Street": "OpenStreetMap",
     "Satellite": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
@@ -256,7 +264,7 @@ _tile_map = {
     "Google Satellite": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
 }
 _default_tiles = _tile_map.get(st.session_state.get("map_layer", "Street"), "OpenStreetMap")
-m = folium.Map(location=center, zoom_start=13, tiles=_default_tiles)
+m = folium.Map(location=center, zoom_start=zoom, tiles=_default_tiles)
 
 # Opaque popup + scrollable content; RTL for Hebrew
 popup_css = """
@@ -420,7 +428,18 @@ for addr, (lat, lon) in geocoded.items():
 
 # ---- Render map (full width, large) ----
 map_height = 700
-map_data = st_folium(m, height=map_height, use_container_width=True, returned_objects=["last_object_clicked", "last_clicked"])
+map_data = st_folium(
+    m,
+    height=map_height,
+    use_container_width=True,
+    returned_objects=["last_object_clicked", "last_clicked", "center", "zoom"],
+)
+# Persist map view so next rerun keeps same position
+if map_data:
+    if map_data.get("center") and map_data["center"].get("lat") is not None:
+        st.session_state["map_center"] = [map_data["center"]["lat"], map_data["center"]["lng"]]
+    if map_data.get("zoom") is not None:
+        st.session_state["map_zoom"] = map_data["zoom"]
 
 # Download standalone HTML (send to anyone—they open in browser, no app needed)
 with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
@@ -510,11 +529,8 @@ if clicked_addr:
     if has_source:
         st.subheader("Floor plans")
         any_found = False
+        unit_files = []
         for i, (_, row) in enumerate(units_at_addr.iterrows()):
-            unit_label = row.get("Unit", f"Unit {i+1}")
-            load_key = f"_loaded_{clicked_addr}_{unit_label}_{i}".replace(" ", "_")
-
-            # Resolve file: Drive = by address+index, else = by Excel PDF column
             pdf_path = None
             drive_file_id = None
             display_filename = None
@@ -527,38 +543,35 @@ if clicked_addr:
                 pdf_path = str(row[pdf_col])
                 display_filename = os.path.basename(pdf_path)
                 any_found = True
-
             if drive_file_id or pdf_path:
-                expander_label = f"{clicked_addr} {i+1}"
-                with st.expander(f"⊕ {expander_label}", expanded=False):
-                    if st.session_state.get(load_key):
-                        if display_filename:
-                            st.caption(f"**{display_filename}**")
-                        if drive_file_id:
-                            preview_url = f"https://drive.google.com/file/d/{drive_file_id}/preview"
-                            view_url = f"https://drive.google.com/file/d/{drive_file_id}/view"
-                            st.markdown(f'<iframe src="{preview_url}" width="100%" height="480" style="border:1px solid #ccc; margin:0"></iframe>', unsafe_allow_html=True)
-                            st.markdown(f'[View in new tab]({view_url})')
-                        elif pdf_path:
-                            with st.spinner("Loading floor plan…"):
-                                pdf_bytes = _get_pdf_bytes(
-                                    pdf_path,
-                                    pdf_uploads or [],
-                                    pdf_folder,
-                                    drive_folder_id,
-                                    drive_api_key,
-                                )
-                            if pdf_bytes:
-                                try:
-                                    b64 = base64.b64encode(pdf_bytes).decode()
-                                    st.markdown(f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="500" type="application/pdf"></iframe>', unsafe_allow_html=True)
-                                except Exception as e:
-                                    st.caption(f"Could not display PDF: {e}")
-                            else:
-                                st.caption(f"PDF not found: `{os.path.basename(pdf_path)}`")
-                    elif st.button("Show floor plan", key=load_key):
-                        st.session_state[load_key] = True
-                        st.rerun()
+                unit_files.append((drive_file_id, pdf_path, display_filename))
+
+        def _render_floor_plan(drive_file_id, pdf_path, display_filename):
+            if display_filename:
+                st.caption(f"**{display_filename}**")
+            if drive_file_id:
+                preview_url = f"https://drive.google.com/file/d/{drive_file_id}/preview"
+                view_url = f"https://drive.google.com/file/d/{drive_file_id}/view"
+                st.markdown(f'<iframe src="{preview_url}" width="100%" height="480" style="border:1px solid #ccc; margin:0"></iframe>', unsafe_allow_html=True)
+                st.markdown(f'[View in new tab]({view_url})')
+            elif pdf_path:
+                pdf_bytes = _get_pdf_bytes(pdf_path, pdf_uploads or [], pdf_folder, drive_folder_id, drive_api_key)
+                if pdf_bytes:
+                    try:
+                        b64 = base64.b64encode(pdf_bytes).decode()
+                        st.markdown(f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="500" type="application/pdf"></iframe>', unsafe_allow_html=True)
+                    except Exception as e:
+                        st.caption(f"Could not display PDF: {e}")
+                else:
+                    st.caption(f"PDF not found: `{os.path.basename(pdf_path)}`")
+
+        if unit_files:
+            if len(unit_files) == 1:
+                _render_floor_plan(unit_files[0][0], unit_files[0][1], unit_files[0][2])
+            else:
+                for i, (fid, pp, fn) in enumerate(unit_files):
+                    with st.expander(f"⊕ {clicked_addr} {i+1}", expanded=False):
+                        _render_floor_plan(fid, pp, fn)
 
         if has_source and not any_found:
             st.caption("No floor plans found for this address.")
