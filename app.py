@@ -15,6 +15,7 @@ import base64
 import tempfile
 import urllib.request
 import urllib.parse
+import urllib.error
 import json
 
 st.set_page_config(page_title="Mom's Apartments Map", layout="wide")
@@ -39,17 +40,28 @@ def _extract_drive_folder_id(url_or_id: str) -> str | None:
     return None
 
 
-def _list_drive_folder(api_key: str, folder_id: str) -> dict[str, str]:
-    """List files in a Google Drive folder. Returns {filename: file_id}."""
+def _list_drive_folder(api_key: str, folder_id: str) -> tuple[dict[str, str], str | None]:
+    """List files in a Google Drive folder. Returns (filename->file_id, error_msg or None)."""
     try:
         q = urllib.parse.quote(f"'{folder_id}' in parents")
         url = f"https://www.googleapis.com/drive/v3/files?q={q}&key={api_key}&fields=files(id,name)"
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
-        return {f["name"]: f["id"] for f in data.get("files", [])}
-    except Exception:
-        return {}
+        files = {f["name"]: f["id"] for f in data.get("files", [])}
+        return files, None
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if e.fp else ""
+        try:
+            err = json.loads(body)
+            msg = err.get("error", {}).get("message", body)
+        except Exception:
+            msg = body or str(e)
+        return {}, f"Drive API error ({e.code}): {msg}"
+    except urllib.error.URLError as e:
+        return {}, f"Network error: {e.reason}"
+    except Exception as e:
+        return {}, str(e)
 
 
 def _download_drive_file(api_key: str, file_id: str) -> bytes | None:
@@ -306,11 +318,15 @@ home_icon = folium.DivIcon(
 
 # Pre-load Drive file list when configured
 drive_files: dict[str, str] = {}
+drive_error: str | None = None
 if drive_configured and drive_api_key and drive_folder_id:
     list_key = f"_drive_list_{drive_folder_id}"
     if list_key not in st.session_state:
-        st.session_state[list_key] = _list_drive_folder(drive_api_key, drive_folder_id)
+        files, err = _list_drive_folder(drive_api_key, drive_folder_id)
+        st.session_state[list_key] = files
+        st.session_state[list_key + "_err"] = err
     drive_files = st.session_state[list_key]
+    drive_error = st.session_state.get(list_key + "_err")
 
 # Only show markers for addresses that have filtered apartments
 for addr, (lat, lon) in geocoded.items():
@@ -444,7 +460,8 @@ def _get_pdf_bytes(
     if drive_folder_id and drive_api_key:
         list_key = f"_drive_list_{drive_folder_id}"
         if list_key not in st.session_state:
-            st.session_state[list_key] = _list_drive_folder(drive_api_key, drive_folder_id)
+            files, _ = _list_drive_folder(drive_api_key, drive_folder_id)
+            st.session_state[list_key] = files
         files = st.session_state[list_key]
         file_id = files.get(filename)
         if file_id:
@@ -518,8 +535,10 @@ if clicked_addr:
         if has_source and not any_found:
             st.caption("No floor plans found for this address.")
             if drive_configured:
-                if not drive_files:
-                    st.warning("Google Drive folder is empty or could not be read. Check API key and folder ID in secrets.")
+                if drive_error:
+                    st.error(f"Google Drive: {drive_error}")
+                elif not drive_files:
+                    st.warning("Google Drive folder is empty. Add PDF/JPEG files (named as address.pdf, address_1.pdf, etc.).")
                 else:
                     expected = f"`{clicked_addr}.pdf`" if len(units_at_addr) == 1 else f"`{clicked_addr}.pdf` / `{clicked_addr}_1.pdf`"
                     st.caption(f"Expected file names in Google Drive (must match column D exactly): {expected}")
