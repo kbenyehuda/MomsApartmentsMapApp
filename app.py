@@ -434,7 +434,6 @@ for addr, (lat, lon) in geocoded.items():
     score_str = f" | <b>סהכ ציון</b> <b>{', '.join(scores)}</b>" if scores else ""
     price_label = (price_col.rstrip(':') if isinstance(price_col, str) else "מחיר") if price_col else "מחיר"
     price_str = f" | <b>{price_label}</b> <b>{', '.join(prices_tooltip)}</b>" if prices_tooltip else ""
-    html = "".join(popup_parts)
     folium.Marker(
         location=[lat, lon],
         popup=folium.Popup(html, max_width=350),
