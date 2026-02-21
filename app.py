@@ -469,6 +469,7 @@ if clicked_addr:
 
     if has_source:
         st.subheader("Floor plans")
+        any_found = False
         for i, (_, row) in enumerate(units_at_addr.iterrows()):
             unit_label = row.get("Unit", f"Unit {i+1}")
             load_key = f"_loaded_{clicked_addr}_{unit_label}_{i}".replace(" ", "_")
@@ -480,8 +481,10 @@ if clicked_addr:
                 found = _find_drive_file_for_unit(drive_files, clicked_addr, i)
                 if found:
                     drive_file_id = found[0]
+                    any_found = True
             elif pdf_col and pdf_col in row.index and pd.notna(row[pdf_col]):
                 pdf_path = str(row[pdf_col])
+                any_found = True
 
             if drive_file_id or pdf_path:
                 with st.expander(f"⊕ {unit_label} — View Floor Plan", expanded=False):
@@ -511,5 +514,16 @@ if clicked_addr:
                     elif st.button("Show floor plan", key=load_key):
                         st.session_state[load_key] = True
                         st.rerun()
+
+        if has_source and not any_found:
+            st.caption("No floor plans found for this address.")
+            if drive_configured:
+                if not drive_files:
+                    st.warning("Google Drive folder is empty or could not be read. Check API key and folder ID in secrets.")
+                else:
+                    expected = f"`{clicked_addr}.pdf`" if len(units_at_addr) == 1 else f"`{clicked_addr}.pdf` / `{clicked_addr}_1.pdf`"
+                    st.caption(f"Expected file names in Google Drive (must match column D exactly): {expected}")
+            else:
+                st.caption("Add a PDF column to your Excel, or configure Google Drive secrets.")
 
 # Table is the AgGrid above; filtered_df drives map and floor plans
