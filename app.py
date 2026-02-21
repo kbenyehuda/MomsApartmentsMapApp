@@ -222,10 +222,11 @@ numeric_cols = [c for c in filter_cols if _is_numeric(c)]
 
 # ---- Table with Excel-style column filters (must run first to get filtered_df for map) ----
 st.subheader("All Apartments")
-st.caption("Click a column header to filter. Filters apply to both the map and table.")
+st.caption("Click a column header to filter, or click a row to view that apartment's floor plan (same as clicking its marker on the map).")
 
 gb = GridOptionsBuilder.from_dataframe(df)
 gb.configure_default_column(filterable=True)
+gb.configure_selection("single", use_checkbox=False)
 for col in df.columns:
     if col in numeric_cols:
         gb.configure_column(col, filter="agNumberColumnFilter", filterParams={"buttons": ["apply", "reset"]})
@@ -237,7 +238,7 @@ grid_return = AgGrid(
     df,
     gridOptions=grid_opts,
     data_return_mode=DataReturnMode.FILTERED,
-    update_mode=GridUpdateMode.FILTERING_CHANGED,
+    update_mode=GridUpdateMode.FILTERING_CHANGED | GridUpdateMode.SELECTION_CHANGED,
     fit_columns_on_grid_load=True,
     height=300,
 )
@@ -428,7 +429,7 @@ def _dist(c1, c2):
     """Simple distance between (lat,lon) points."""
     return (c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2
 
-# Find which address was clicked (nearest marker); persist for next run (icon distinction)
+# Find which address was selected: from map click or table row click
 clicked_addr = None
 click_data = map_data.get("last_object_clicked") or map_data.get("last_clicked")
 if click_data and "lat" in click_data and "lng" in click_data:
@@ -439,6 +440,10 @@ if click_data and "lat" in click_data and "lng" in click_data:
         if d < best_d:
             best_d, best_addr = d, addr
     clicked_addr = best_addr
+else:
+    selected_rows = grid_return.get("selected_rows") if grid_return else []
+    if selected_rows and address_col in selected_rows[0]:
+        clicked_addr = str(selected_rows[0][address_col]).strip()
 if clicked_addr is not None:
     st.session_state["_clicked_addr"] = clicked_addr
 
