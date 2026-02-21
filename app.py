@@ -164,10 +164,10 @@ _tile_map = {
 _default_tiles = _tile_map.get(st.session_state.get("map_layer", "Street"), "OpenStreetMap")
 m = folium.Map(location=center, zoom_start=13, tiles=_default_tiles)
 
-# Opaque popup + scrollable content
+# Opaque popup + scrollable content; RTL for Hebrew
 popup_css = """
 .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: white !important; opacity: 1 !important; }
-.leaflet-popup-content { margin: 12px 16px !important; max-height: 280px !important; overflow-y: auto !important; }
+.leaflet-popup-content { margin: 12px 16px !important; max-height: 280px !important; overflow-y: auto !important; direction: rtl !important; text-align: right !important; }
 """
 m.get_root().header.add_child(folium.Element(f"<style>{popup_css}</style>"))
 
@@ -194,9 +194,26 @@ folium.TileLayer(
 ).add_to(m)
 folium.LayerControl(position="topright").add_to(m)
 
+def _price_to_m(val):
+    """Format price in millions: 6_000_000 → 6 מש״ח, 5_900_000 → 5.9 מש״ח. Below 1M stays as-is."""
+    try:
+        s = str(val).replace(",", "").replace(" ", "")
+        num = float(s)
+        if num >= 1_000_000:
+            m = num / 1_000_000
+            fmt = f"{m:.1f}".rstrip("0").rstrip(".")
+            return f"{fmt} מש״ח"
+        return str(val)
+    except (ValueError, TypeError):
+        return str(val)
+
+
 # Attributes to show in popup (exclude PDF path, address—it's the popup title); columns with "ציון" last
+# Price shown under title, so exclude from table
 base_cols = [c for c in df.columns if c not in ["Floor Plan PDF", "Address", address_col] and "PDF" not in c]
-info_cols = [c for c in base_cols if "ציון" not in c] + [c for c in base_cols if "ציון" in c]
+price_col = next((c for c in df.columns if isinstance(c, str) and ("מחיר" in c or c == "Price")), None)
+base_cols_no_price = [c for c in base_cols if c != price_col] if price_col else base_cols
+info_cols = [c for c in base_cols_no_price if "ציון" not in c] + [c for c in base_cols_no_price if "ציון" in c]
 
 # Home icon for markers (DivIcon with emoji - works without external fonts)
 home_icon = folium.DivIcon(
@@ -211,7 +228,13 @@ for addr, (lat, lon) in geocoded.items():
     if units.empty:
         continue
 
-    popup_parts = [f"<b>{addr}</b><hr style='margin:8px 0'>"]
+    popup_parts = [f"<b>{addr}</b>"]
+    if price_col and price_col in units.columns:
+        prices = [_price_to_m(row[price_col]) for _, row in units.iterrows() if pd.notna(row.get(price_col))]
+        if prices:
+            price_label = price_col.rstrip(':') if isinstance(price_col, str) else "מחיר"
+            popup_parts.append(f"<div style='margin:4px 0 8px 0'><b>{price_label}</b>: {', '.join(prices)}</div>")
+    popup_parts.append("<hr style='margin:8px 0'>")
     for i, (_, row) in enumerate(units.iterrows()):
         if i > 0:
             popup_parts.append("<hr style='margin:14px 0; border: none; border-top: 2px solid #333'>")
@@ -238,13 +261,19 @@ for addr, (lat, lon) in geocoded.items():
     if score_col and score_col in units.columns:
         for v in units[score_col].dropna():
             scores.append(str(v))
+    prices_tooltip = []
+    if price_col and price_col in units.columns:
+        for v in units[price_col].dropna():
+            prices_tooltip.append(_price_to_m(v))
     units_part = f" ({n_units} units)" if n_units > 1 else ""
     score_str = f" | <b>סהכ ציון</b> <b>{', '.join(scores)}</b>" if scores else ""
+    price_label = (price_col.rstrip(':') if isinstance(price_col, str) else "מחיר") if price_col else "מחיר"
+    price_str = f" | <b>{price_label}</b> <b>{', '.join(prices_tooltip)}</b>" if prices_tooltip else ""
     html = "".join(popup_parts)
     folium.Marker(
         location=[lat, lon],
         popup=folium.Popup(html, max_width=350),
-        tooltip=folium.Tooltip(f"{addr}{units_part}{score_str}", sticky=True),
+        tooltip=folium.Tooltip(f"{addr}{units_part}{price_str}{score_str}", sticky=True),
         icon=home_icon,
     ).add_to(m)
 
