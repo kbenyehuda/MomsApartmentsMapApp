@@ -441,9 +441,14 @@ if click_data and "lat" in click_data and "lng" in click_data:
             best_d, best_addr = d, addr
     clicked_addr = best_addr
 else:
-    selected_rows = grid_return.get("selected_rows") if grid_return else []
-    if selected_rows and address_col in selected_rows[0]:
-        clicked_addr = str(selected_rows[0][address_col]).strip()
+    selected_rows = grid_return.get("selected_rows") if grid_return else None
+    if selected_rows is not None:
+        try:
+            row = selected_rows.iloc[0] if hasattr(selected_rows, "iloc") else selected_rows[0]
+            if address_col in (row.index if hasattr(row, "index") else row):
+                clicked_addr = str(row[address_col]).strip()
+        except (IndexError, KeyError, TypeError):
+            pass
 if clicked_addr is not None:
     st.session_state["_clicked_addr"] = clicked_addr
 
