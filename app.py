@@ -247,15 +247,7 @@ if filtered_df is None or filtered_df.empty:
     filtered_df = df
 
 # ---- Build map (using filtered_df from table) ----
-# Preserve map view across reruns (avoid jump when clicking marker)
-default_center = list(geocoded.values())[0]
-default_zoom = 13
-if "map_center" not in st.session_state:
-    st.session_state["map_center"] = default_center
-if "map_zoom" not in st.session_state:
-    st.session_state["map_zoom"] = default_zoom
-center = st.session_state["map_center"]
-zoom = st.session_state["map_zoom"]
+center = list(geocoded.values())[0]
 _tile_map = {
     "Street": "OpenStreetMap",
     "Satellite": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
@@ -264,7 +256,7 @@ _tile_map = {
     "Google Satellite": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
 }
 _default_tiles = _tile_map.get(st.session_state.get("map_layer", "Street"), "OpenStreetMap")
-m = folium.Map(location=center, zoom_start=zoom, tiles=_default_tiles)
+m = folium.Map(location=center, zoom_start=13, tiles=_default_tiles)
 
 # Opaque popup + scrollable content; RTL for Hebrew
 popup_css = """
@@ -318,16 +310,10 @@ base_cols_no_price = [c for c in base_cols if c != price_col] if price_col else 
 info_cols_main = [c for c in base_cols_no_price if "ציון" not in c]
 info_cols_tzion = [c for c in base_cols_no_price if "ציון" in c]
 
-# Home icons: normal and selected (when this address has PDF shown below)
 home_icon = folium.DivIcon(
     html='<div style="font-size: 28px; line-height: 1;">🏠</div>',
     icon_size=(28, 28),
     icon_anchor=(14, 14),
-)
-home_icon_selected = folium.DivIcon(
-    html='<div style="font-size: 32px; line-height: 1; filter: drop-shadow(0 0 4px #0066ff) drop-shadow(0 0 8px #0066ff);">🏠</div>',
-    icon_size=(32, 32),
-    icon_anchor=(16, 16),
 )
 
 # Pre-load Drive file list when configured
@@ -342,8 +328,6 @@ if drive_configured and drive_api_key and drive_folder_id:
     drive_files = st.session_state[list_key]
     drive_error = st.session_state.get(list_key + "_err")
 
-# Selected address (from previous click) for icon distinction
-selected_addr = st.session_state.get("_clicked_addr")
 # Only show markers for addresses that have filtered apartments
 for addr, (lat, lon) in geocoded.items():
     units = filtered_df[filtered_df[address_col] == addr]
@@ -418,28 +402,16 @@ for addr, (lat, lon) in geocoded.items():
     price_label = (price_col.rstrip(':') if isinstance(price_col, str) else "מחיר") if price_col else "מחיר"
     price_str = f" | <b>{price_label}</b> <b>{', '.join(prices_tooltip)}</b>" if prices_tooltip else ""
     html = "".join(popup_parts)
-    icon = home_icon_selected if addr == selected_addr else home_icon
     folium.Marker(
         location=[lat, lon],
         popup=folium.Popup(html, max_width=350),
         tooltip=folium.Tooltip(f"{addr}{units_part}{price_str}{score_str}", sticky=True),
-        icon=icon,
+        icon=home_icon,
     ).add_to(m)
 
 # ---- Render map (full width, large) ----
 map_height = 700
-map_data = st_folium(
-    m,
-    height=map_height,
-    use_container_width=True,
-    returned_objects=["last_object_clicked", "last_clicked", "center", "zoom"],
-)
-# Persist map view so next rerun keeps same position
-if map_data:
-    if map_data.get("center") and map_data["center"].get("lat") is not None:
-        st.session_state["map_center"] = [map_data["center"]["lat"], map_data["center"]["lng"]]
-    if map_data.get("zoom") is not None:
-        st.session_state["map_zoom"] = map_data["zoom"]
+map_data = st_folium(m, height=map_height, use_container_width=True, returned_objects=["last_object_clicked", "last_clicked"])
 
 # Download standalone HTML (send to anyone—they open in browser, no app needed)
 with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
