@@ -27,7 +27,9 @@ The folder ID is the part after `/folders/`. You can use the full URL or just th
 
 ## 4. Add secrets (one-time setup)
 
-In **Streamlit Cloud** → your app → **Settings** → **Secrets**, add:
+**Streamlit Cloud (deployed):** In your app → **Settings** → **Secrets**, add:
+
+**Local development:** Either create `.streamlit/secrets.toml` (copy from `secrets.toml.example`) **or** use the sidebar inputs—when secrets aren't set, the app shows optional fields for API key and folder ID. Paste your values there.
 
 ```toml
 GOOGLE_DRIVE_API_KEY = "AIza_your_api_key_here"

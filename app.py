@@ -76,6 +76,17 @@ def _download_drive_file(api_key: str, file_id: str) -> bytes | None:
         return None
 
 
+def _get_drive_file_bytes(api_key: str, file_id: str) -> bytes | None:
+    """Download file from Drive by ID. Cached in session to avoid repeated API calls."""
+    cache_key = f"_drive_bytes_{file_id}"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+    data = _download_drive_file(api_key, file_id)
+    if data:
+        st.session_state[cache_key] = data
+    return data
+
+
 def _find_drive_file_for_unit(files: dict[str, str], address: str, unit_index: int) -> tuple[str, str, str] | None:
     """
     Find Drive file by address + unit index. Address must match column D exactly.
@@ -142,6 +153,16 @@ def _get_drive_secrets():
 
 drive_api_key, drive_folder_id = _get_drive_secrets()
 drive_configured = bool(drive_api_key and drive_folder_id)
+
+# Fallback: when secrets/env not set, allow manual entry (e.g. local dev, or secrets in global ~/.streamlit/secrets.toml)
+if not drive_configured:
+    st.sidebar.caption("Google Drive (optional)")
+    manual_key = st.sidebar.text_input("Drive API key", placeholder="AIza...", key="drive_api_key_manual")
+    manual_folder = st.sidebar.text_input("Drive folder ID or URL", placeholder="1ABC... or folder URL", key="drive_folder_manual")
+    if manual_key and manual_folder:
+        drive_api_key = manual_key.strip()
+        drive_folder_id = _extract_drive_folder_id(manual_folder.strip()) or manual_folder.strip()
+        drive_configured = True
 
 pdf_folder = None
 pdf_uploads = None
@@ -260,14 +281,15 @@ if filtered_df is None or filtered_df.empty:
 # ---- Build map (using filtered_df from table) ----
 center = list(geocoded.values())[0]
 _tile_map = {
-    "Street": "OpenStreetMap",
-    "Satellite": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-    "Terrain": "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
-    "Google Street": "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}",
-    "Google Satellite": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+    "Street": ("OpenStreetMap", None),
+    "Satellite": ("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", "Esri"),
+    "Terrain": ("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", '&copy; <a href="https://opentopomap.org/">OpenTopoMap</a>'),
+    "Google Street": ("https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}", "Google"),
+    "Google Satellite": ("https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}", "Google"),
 }
-_default_tiles = _tile_map.get(st.session_state.get("map_layer", "Street"), "OpenStreetMap")
-m = folium.Map(location=center, zoom_start=13, tiles=_default_tiles)
+_layer = st.session_state.get("map_layer", "Street")
+_tiles, _attr = _tile_map.get(_layer, _tile_map["Street"])
+m = folium.Map(location=center, zoom_start=13, tiles=_tiles, attr=_attr)
 
 # Opaque popup + scrollable content; RTL for Hebrew; dark text; highlight for selected marker
 selected_addr = st.session_state.get("_clicked_addr") or ""
@@ -376,13 +398,11 @@ def _build_popup_html(addr, units, drive_files, price_col, info_cols_main, info_
             found = _find_drive_file_for_unit(drive_files, addr, i)
             if found:
                 fid, _, _ = found
-                preview_url = f"https://drive.google.com/file/d/{fid}/preview"
                 view_url = f"https://drive.google.com/file/d/{fid}/view"
                 popup_parts.append(
                     '<details style="margin:4px 0"><summary style="cursor:pointer; font-size:12px">הצג תוכנית</summary>'
                     f'<div style="margin:2px 0; padding:0">'
-                    f'<iframe src="{preview_url}" width="100%" height="120" style="border:1px solid #ccc; border-radius:4px; margin:0" allow="autoplay"></iframe>'
-                    f'<a href="{view_url}" target="_blank" rel="noopener" style="font-size:11px; display:block; margin-top:2px">View in new tab</a>'
+                    f'<a href="{view_url}" target="_blank" rel="noopener" style="font-size:12px">View floor plan in new tab</a>'
                     f'</div></details>'
                 )
     popup_parts.append("</div>")
@@ -557,26 +577,33 @@ if clicked_addr:
         for i, (_, row) in enumerate(units_at_addr.iterrows()):
             pdf_path = None
             drive_file_id = None
+            drive_file_type = None
             display_filename = None
             if drive_configured and drive_files:
                 found = _find_drive_file_for_unit(drive_files, clicked_addr, i)
                 if found:
-                    drive_file_id, _, display_filename = found
+                    drive_file_id, drive_file_type, display_filename = found
                     any_found = True
             elif pdf_col and pdf_col in row.index and pd.notna(row[pdf_col]):
                 pdf_path = str(row[pdf_col])
                 display_filename = os.path.basename(pdf_path)
                 any_found = True
             if drive_file_id or pdf_path:
-                unit_files.append((drive_file_id, pdf_path, display_filename))
+                unit_files.append((drive_file_id, drive_file_type, pdf_path, display_filename))
 
-        def _render_floor_plan(drive_file_id, pdf_path, display_filename):
+        def _render_floor_plan(drive_file_id, drive_file_type, pdf_path, display_filename):
             if display_filename:
                 st.caption(f"**{display_filename}**")
-            if drive_file_id:
-                preview_url = f"https://drive.google.com/file/d/{drive_file_id}/preview"
+            if drive_file_id and drive_api_key:
+                # Fetch via Drive API and display inline (Google blocks iframe embed of preview URL)
+                data = _get_drive_file_bytes(drive_api_key, drive_file_id)
+                if data:
+                    b64 = base64.b64encode(data).decode()
+                    mime = "application/pdf" if drive_file_type == "pdf" else "image/jpeg"
+                    st.markdown(f'<iframe src="data:{mime};base64,{b64}" width="100%" height="500" type="{mime}"></iframe>', unsafe_allow_html=True)
+                else:
+                    st.caption("Could not load file from Drive. Ensure the file is shared (Anyone with the link).")
                 view_url = f"https://drive.google.com/file/d/{drive_file_id}/view"
-                st.markdown(f'<iframe src="{preview_url}" width="100%" height="480" style="border:1px solid #ccc; margin:0"></iframe>', unsafe_allow_html=True)
                 st.markdown(f'[View in new tab]({view_url})')
             elif pdf_path:
                 pdf_bytes = _get_pdf_bytes(pdf_path, pdf_uploads or [], pdf_folder, drive_folder_id, drive_api_key)
@@ -591,11 +618,12 @@ if clicked_addr:
 
         if unit_files:
             if len(unit_files) == 1:
-                _render_floor_plan(unit_files[0][0], unit_files[0][1], unit_files[0][2])
+                fid, ftype, pp, fn = unit_files[0]
+                _render_floor_plan(fid, ftype, pp, fn)
             else:
-                for i, (fid, pp, fn) in enumerate(unit_files):
+                for i, (fid, ftype, pp, fn) in enumerate(unit_files):
                     with st.expander(f"⊕ {clicked_addr} {i+1}", expanded=False):
-                        _render_floor_plan(fid, pp, fn)
+                        _render_floor_plan(fid, ftype, pp, fn)
 
         if has_source and not any_found:
             st.caption("No floor plans found for this address.")
