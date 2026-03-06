@@ -188,25 +188,33 @@ _idx = layer_options.index(st.session_state["map_layer"]) if st.session_state["m
 map_layer = st.sidebar.radio("Map layer", layer_options, index=_idx, key="map_layer_radio")
 st.session_state["map_layer"] = map_layer
 
-# Address column: "כתובת-מיקום" if present, else column D (index 3)
-def _get_address_col(df: pd.DataFrame, from_col_d: bool = False) -> str:
-    if "כתובת-מיקום" in df.columns:
-        return "כתובת-מיקום"
-    return df.columns[0] if from_col_d else (df.columns[3] if len(df.columns) > 3 else df.columns[0])
+# Address column: find by name (supports "כתובת-מיקום" and "כתובת - מיקום")
+def _get_address_col(df: pd.DataFrame) -> str | None:
+    """Find address column by name. Supports 'כתובת-מיקום' and 'כתובת - מיקום'."""
+    for c in df.columns:
+        if not isinstance(c, str):
+            continue
+        s = c.strip()
+        if s in ("כתובת-מיקום", "כתובת - מיקום"):
+            return c
+        if "כתובת" in c and "מיקום" in c and "ציון" not in c:
+            return c
+    return None
 
 # Require Excel upload
-from_col_d = False
 if excel_file is None:
     st.info("Please upload an Excel file.")
     st.stop()
-else:
-    df_full = pd.read_excel(excel_file, sheet_name="דירוג", header=0)
-    df = df_full.iloc[:, 3:]  # columns D onwards (skip A,B,C)
-    from_col_d = True
-    st.sidebar.success(f"Loaded {len(df)} apartments")
 
-# Resolve address column: כתובת-מיקום or column D
-address_col = _get_address_col(df, from_col_d)
+df_full = pd.read_excel(excel_file, sheet_name="דירוג", header=0)
+address_col = _get_address_col(df_full)
+if address_col is None:
+    st.error("Could not find address column (כתובת - מיקום or כתובת-מיקום).")
+    st.stop()
+
+addr_idx = df_full.columns.get_loc(address_col)
+df = df_full.iloc[:, addr_idx:].copy()
+st.sidebar.success(f"Loaded {len(df)} apartments")
 
 # ---- Geocode addresses (cached—runs once per set of addresses) ----
 unique_addresses = [str(a).strip() for a in df[address_col].dropna().unique().tolist() if a and str(a).strip()]
